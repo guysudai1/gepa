@@ -171,6 +171,77 @@ class TestLMBatchComplete:
         call_kwargs = mock_batch.call_args[1]
         assert call_kwargs["temperature"] == 0.9
 
+    @patch("tqdm.auto.tqdm")
+    @patch("litellm.completion")
+    def test_batch_complete_progress_preserves_input_order(self, mock_completion, mock_tqdm):
+        """The observable progress path returns results in request order."""
+        mock_tqdm.side_effect = lambda iterator, **_kwargs: MagicMock(
+            __enter__=lambda _self: iterator,
+            __exit__=lambda *_args: False,
+        )
+
+        def complete(*, messages, **_kwargs):
+            response = MagicMock()
+            response.choices = [MagicMock()]
+            response.choices[0].message.content = messages[0]["content"]
+            response.choices[0].finish_reason = "stop"
+            response.usage = None
+            return response
+
+        mock_completion.side_effect = complete
+        lm = LM("openai/gpt-4.1", show_batch_progress=True, batch_progress_desc="test batch")
+        msgs = [
+            [{"role": "user", "content": "first"}],
+            [{"role": "user", "content": "second"}],
+        ]
+
+        assert lm.batch_complete(msgs, max_workers=2) == ["first", "second"]
+        mock_tqdm.assert_called_once()
+        assert mock_tqdm.call_args.kwargs["total"] == 2
+        assert mock_tqdm.call_args.kwargs["desc"] == "test batch"
+
+
+class TestLMCostTracking:
+    @patch("litellm.completion_cost", return_value=999.0)
+    @patch("litellm.completion")
+    def test_provider_reported_cost_takes_priority(self, mock_completion, _mock_cost):
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = "answer"
+        response.choices[0].finish_reason = "stop"
+        response.usage.prompt_tokens = 100
+        response.usage.completion_tokens = 20
+        response.usage.cost = 0.0123
+        response.usage.provider_reported_cost_usd = None
+        mock_completion.return_value = response
+
+        lm = LM("openrouter/example")
+        lm("question")
+
+        assert lm.total_cost == 0.0123
+        assert lm.cost_breakdown["calls_by_source"]["provider"] == 1
+
+    @patch("litellm.completion_cost", return_value=0.0)
+    @patch("litellm.completion")
+    def test_configured_token_price_fallback(self, mock_completion, _mock_cost):
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = "answer"
+        response.choices[0].finish_reason = "stop"
+        response.usage.prompt_tokens = 1_000_000
+        response.usage.completion_tokens = 500_000
+        response.usage.cost = None
+        response.usage.provider_reported_cost_usd = None
+        response._hidden_params = {}
+        mock_completion.return_value = response
+
+        lm = LM("openrouter/example", input_cost_per_million=0.02, output_cost_per_million=0.10)
+        lm("question")
+
+        assert lm.total_cost == 0.07
+        assert lm.cost_breakdown["calls_by_source"]["estimated"] == 1
+        assert lm.cost_breakdown["contains_estimates"] is True
+
 
 class TestLMRepr:
     def test_repr(self):
@@ -185,7 +256,6 @@ class TestLMConformsToProtocol:
     def test_callable(self):
         lm = LM("openai/gpt-4.1")
         assert callable(lm)
-        assert hasattr(lm, "__call__")
 
 
 class TestLMRetries:

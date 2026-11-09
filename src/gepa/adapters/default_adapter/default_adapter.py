@@ -96,6 +96,11 @@ class DefaultAdapter(GEPAAdapter[DefaultDataInst, DefaultTrajectory, DefaultRoll
             from gepa.lm import LM
 
             self._lm = LM(model)
+        elif callable(getattr(model, "batch_complete", None)):
+            # GEPA's LM wrapper is a callable object, not a model string. Use
+            # its batch API when available instead of silently evaluating the
+            # entire validation set one request at a time.
+            self._lm = model
         else:
             self._lm = None
         self.model = model

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, cast
 
 logger = logging.getLogger(__name__)
@@ -64,6 +65,10 @@ class LM:
         temperature: Sampling temperature.
         max_tokens: Maximum tokens to generate.
         num_retries: Number of retries on transient failures (default 3).
+        show_batch_progress: Show per-request progress for batched completions.
+        batch_progress_desc: Label used by the batch progress bar.
+        input_cost_per_million: Fallback USD price per million input tokens.
+        output_cost_per_million: Fallback USD price per million output tokens.
         **kwargs: Extra keyword arguments forwarded to ``litellm.completion``
             (e.g. ``top_p``, ``stop``, ``api_key``, ``api_base``).
     """
@@ -74,13 +79,23 @@ class LM:
         temperature: float | None = None,
         max_tokens: int | None = None,
         num_retries: int = 3,
+        show_batch_progress: bool = False,
+        batch_progress_desc: str = "LM batch",
+        input_cost_per_million: float | None = None,
+        output_cost_per_million: float | None = None,
         **kwargs: Any,
     ):
         self.model = model
         self.num_retries = num_retries
+        self.show_batch_progress = show_batch_progress
+        self.batch_progress_desc = batch_progress_desc
+        self.input_cost_per_million = input_cost_per_million
+        self.output_cost_per_million = output_cost_per_million
         self._total_cost: float = 0.0
         self._total_tokens_in: int = 0
         self._total_tokens_out: int = 0
+        self._cost_by_source: dict[str, float] = {"provider": 0.0, "litellm": 0.0, "estimated": 0.0}
+        self._cost_calls_by_source: dict[str, int] = {"provider": 0, "litellm": 0, "estimated": 0, "unpriced": 0}
         self._cost_lock = threading.Lock()
 
         self.completion_kwargs: dict[str, Any] = {
@@ -103,6 +118,66 @@ class LM:
     def total_tokens_out(self) -> int:
         """Cumulative output (completion) tokens across all calls."""
         return self._total_tokens_out
+
+    @property
+    def cost_breakdown(self) -> dict[str, Any]:
+        """Cost totals and response counts grouped by how cost was obtained."""
+        with self._cost_lock:
+            return {
+                "usd_by_source": dict(self._cost_by_source),
+                "calls_by_source": dict(self._cost_calls_by_source),
+                "contains_estimates": self._cost_calls_by_source["estimated"] > 0,
+                "contains_unpriced_calls": self._cost_calls_by_source["unpriced"] > 0,
+            }
+
+    @staticmethod
+    def _numeric_attr(obj: Any, name: str) -> float | None:
+        value = getattr(obj, name, None) if obj is not None else None
+        return float(value) if isinstance(value, int | float) else None
+
+    def _extract_response_cost(self, completion: Any, litellm: Any, tokens_in: int, tokens_out: int) -> tuple[float, str]:
+        """Prefer provider-reported cost, then LiteLLM, then configured token prices."""
+        usage = getattr(completion, "usage", None)
+        for field in ("cost", "provider_reported_cost_usd"):
+            provider_cost = self._numeric_attr(usage, field)
+            if provider_cost is not None and provider_cost > 0:
+                return provider_cost, "provider"
+
+        hidden = getattr(completion, "_hidden_params", None)
+        if isinstance(hidden, dict):
+            hidden_cost = hidden.get("response_cost")
+            if isinstance(hidden_cost, int | float) and hidden_cost > 0:
+                return float(hidden_cost), "provider"
+
+        try:
+            computed_cost = litellm.completion_cost(completion_response=completion)
+            if isinstance(computed_cost, int | float) and computed_cost > 0:
+                return float(computed_cost), "litellm"
+        except Exception:
+            pass
+
+        if self.input_cost_per_million is not None and self.output_cost_per_million is not None:
+            estimated_cost = (
+                tokens_in * self.input_cost_per_million + tokens_out * self.output_cost_per_million
+            ) / 1_000_000
+            return estimated_cost, "estimated"
+        return 0.0, "unpriced"
+
+    def _record_completion_usage(self, completion: Any, litellm: Any) -> None:
+        usage = getattr(completion, "usage", None)
+        raw_tokens_in = getattr(usage, "prompt_tokens", 0) if usage is not None else 0
+        raw_tokens_out = getattr(usage, "completion_tokens", 0) if usage is not None else 0
+        tokens_in = int(raw_tokens_in) if isinstance(raw_tokens_in, int) else 0
+        tokens_out = int(raw_tokens_out) if isinstance(raw_tokens_out, int) else 0
+        cost, source = self._extract_response_cost(completion, litellm, tokens_in, tokens_out)
+
+        with self._cost_lock:
+            self._total_cost += cost
+            self._total_tokens_in += tokens_in
+            self._total_tokens_out += tokens_out
+            self._cost_calls_by_source[source] += 1
+            if source != "unpriced":
+                self._cost_by_source[source] += cost
 
     def _check_truncation(self, choices: list[Any]) -> None:
         if any(getattr(c, "finish_reason", None) == "length" for c in choices):
@@ -131,21 +206,7 @@ class LM:
         # Non-streaming calls always return ModelResponse (not CustomStreamWrapper)
         self._check_truncation(completion.choices)  # type: ignore[union-attr]
 
-        # Accumulate cost
-        try:
-            cost = litellm.completion_cost(completion_response=completion) or 0.0  # type: ignore[attr-defined]
-        except Exception:
-            cost = 0.0
-
-        # Accumulate token usage
-        usage = getattr(completion, "usage", None)
-        tokens_in = (getattr(usage, "prompt_tokens", 0) or 0) if usage is not None else 0
-        tokens_out = (getattr(usage, "completion_tokens", 0) or 0) if usage is not None else 0
-
-        with self._cost_lock:
-            self._total_cost += cost
-            self._total_tokens_in += tokens_in
-            self._total_tokens_out += tokens_out
+        self._record_completion_usage(completion, litellm)
 
         choice = completion.choices[0]  # type: ignore[union-attr]
         return LMOutput(choice.message.content or "", finish_reason=getattr(choice, "finish_reason", None))
@@ -168,18 +229,47 @@ class LM:
         import litellm
 
         merged = {**self.completion_kwargs, **kwargs}
-        responses = litellm.batch_completion(
-            model=self.model,
-            messages=messages_list,
-            max_workers=max_workers,
-            num_retries=self.num_retries,
-            drop_params=True,
-            **merged,
-        )
+        if self.show_batch_progress and messages_list:
+            # LiteLLM's batch_completion waits for the entire executor before
+            # returning, so callers cannot observe incremental progress. Submit
+            # the same calls here and consume futures as they finish while
+            # retaining the input order expected by GEPA adapters.
+            from tqdm.auto import tqdm
 
-        batch_cost = 0.0
-        batch_tokens_in = 0
-        batch_tokens_out = 0
+            responses: list[Any] = [None] * len(messages_list)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_index = {
+                    executor.submit(
+                        litellm.completion,
+                        model=self.model,
+                        messages=messages,
+                        num_retries=self.num_retries,
+                        drop_params=True,
+                        **merged,
+                    ): index
+                    for index, messages in enumerate(messages_list)
+                }
+                completed = as_completed(future_to_index)
+                with tqdm(
+                    completed,
+                    total=len(future_to_index),
+                    desc=self.batch_progress_desc,
+                    unit="example",
+                    dynamic_ncols=True,
+                    leave=True,
+                ) as progress:
+                    for future in progress:
+                        responses[future_to_index[future]] = future.result()
+        else:
+            responses = litellm.batch_completion(
+                model=self.model,
+                messages=messages_list,
+                max_workers=max_workers,
+                num_retries=self.num_retries,
+                drop_params=True,
+                **merged,
+            )
+
         results: list[str] = []
         for resp in responses:
             self._check_truncation(resp.choices)
@@ -187,19 +277,7 @@ class LM:
             results.append(
                 LMOutput(choice.message.content or "", finish_reason=getattr(choice, "finish_reason", None)).strip()
             )
-            try:
-                batch_cost += litellm.completion_cost(completion_response=resp) or 0.0  # type: ignore[attr-defined]
-            except Exception:
-                pass
-            usage = getattr(resp, "usage", None)
-            if usage is not None:
-                batch_tokens_in += getattr(usage, "prompt_tokens", 0) or 0
-                batch_tokens_out += getattr(usage, "completion_tokens", 0) or 0
-
-        with self._cost_lock:
-            self._total_cost += batch_cost
-            self._total_tokens_in += batch_tokens_in
-            self._total_tokens_out += batch_tokens_out
+            self._record_completion_usage(resp, litellm)
 
         return results
 
